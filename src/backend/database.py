@@ -4,12 +4,125 @@ MongoDB database configuration and setup for Mergington High School API
 
 from pymongo import MongoClient
 from argon2 import PasswordHasher
+import logging
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+# In-memory fallback storage for development
+_in_memory_activities = {}
+_in_memory_teachers = {}
+_use_memory_fallback = False
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Try to connect to MongoDB, fall back to in-memory storage
+try:
+    client = MongoClient('mongodb://localhost:27017/', serverSelectionTimeoutMS=5000)
+    # Test connection
+    client.admin.command('ping')
+    db = client['mergington_high']
+    activities_collection = db['activities']
+    teachers_collection = db['teachers']
+    logger.info("Connected to MongoDB successfully")
+except Exception as e:
+    logger.warning(f"MongoDB connection failed: {e}. Using in-memory storage for development.")
+    _use_memory_fallback = True
+    
+    # Create mock collection classes for in-memory storage
+    class MockCollection:
+        def __init__(self, name):
+            self.name = name
+            self.data = _in_memory_activities if name == 'activities' else _in_memory_teachers
+        
+        def count_documents(self, filter_dict):
+            return len(self.data)
+        
+        def insert_one(self, doc):
+            doc_id = doc.get('_id', len(self.data))
+            self.data[doc_id] = doc
+            return type('InsertResult', (), {'inserted_id': doc_id})()
+        
+        def find(self, filter_dict=None):
+            if filter_dict is None:
+                # Return all documents with _id field included
+                return [{'_id': doc_id, **doc} for doc_id, doc in self.data.items()]
+            
+            results = []
+            for doc_id, doc in self.data.items():
+                match = True
+                doc_with_id = {'_id': doc_id, **doc}
+                for key, value in filter_dict.items():
+                    if key == "schedule_details.days":
+                        # Handle nested array search like MongoDB's $in operator
+                        if "$in" in value:
+                            doc_days = doc.get("schedule_details", {}).get("days", [])
+                            if not any(day in doc_days for day in value["$in"]):
+                                match = False
+                                break
+                    elif key == "schedule_details.start_time":
+                        # Handle time comparison
+                        if "$gte" in value:
+                            doc_time = doc.get("schedule_details", {}).get("start_time", "")
+                            if doc_time < value["$gte"]:
+                                match = False
+                                break
+                    elif key == "schedule_details.end_time":
+                        # Handle time comparison
+                        if "$lte" in value:
+                            doc_time = doc.get("schedule_details", {}).get("end_time", "")
+                            if doc_time > value["$lte"]:
+                                match = False
+                                break
+                    elif doc_with_id.get(key) != value:
+                        match = False
+                        break
+                if match:
+                    results.append(doc_with_id)
+            return results
+        
+        def find_one(self, filter_dict):
+            for doc_id, doc in self.data.items():
+                doc_with_id = {'_id': doc_id, **doc}
+                if all(doc_with_id.get(k) == v for k, v in filter_dict.items()):
+                    return doc_with_id
+            return None
+        
+        def update_one(self, filter_dict, update_dict):
+            for doc_id, doc in self.data.items():
+                if all(doc.get(k) == v for k, v in filter_dict.items()):
+                    if '$push' in update_dict:
+                        for field, value in update_dict['$push'].items():
+                            if field not in doc:
+                                doc[field] = []
+                            doc[field].append(value)
+                    if '$pull' in update_dict:
+                        for field, value in update_dict['$pull'].items():
+                            if field in doc and isinstance(doc[field], list):
+                                while value in doc[field]:
+                                    doc[field].remove(value)
+                    return type('UpdateResult', (), {'modified_count': 1})()
+            return type('UpdateResult', (), {'modified_count': 0})()
+        
+        def aggregate(self, pipeline):
+            # Simple aggregation implementation for the days endpoint
+            if not pipeline:
+                return []
+            
+            results = []
+            # For the specific pipeline used in get_available_days
+            if len(pipeline) >= 2 and "$unwind" in pipeline[0] and "$group" in pipeline[1]:
+                all_days = set()
+                for doc in self.data.values():
+                    days = doc.get("schedule_details", {}).get("days", [])
+                    all_days.update(days)
+                
+                # Return in sorted order
+                for day in sorted(all_days):
+                    results.append({"_id": day})
+            
+            return results
+    
+    activities_collection = MockCollection('activities')
+    teachers_collection = MockCollection('teachers')
 
 # Methods
 def hash_password(password):
@@ -163,6 +276,17 @@ initial_activities = {
         },
         "max_participants": 16,
         "participants": ["william@mergington.edu", "jacob@mergington.edu"]
+    },
+    "Manga Maniacs": {
+        "description": "Dive into epic adventures with legendary heroes, intense battles, and unforgettable friendships! Discover amazing manga series, share your favorite characters, and join fellow otaku in passionate discussions about the most incredible stories from Japan.",
+        "schedule": "Tuesdays, 7:00 PM - 8:00 PM",
+        "schedule_details": {
+            "days": ["Tuesday"],
+            "start_time": "19:00",
+            "end_time": "20:00"
+        },
+        "max_participants": 15,
+        "participants": []
     }
 }
 
